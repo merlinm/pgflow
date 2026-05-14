@@ -408,6 +408,119 @@ $code$;
 
 
 
+CREATE OR REPLACE FUNCTION flow.create_flow(
+  _flow TEXT,
+  _arguments JSONB,
+  _only_these_nodes TEXT[] DEFAULT NULL, 
+  _add_parents BOOL DEFAULT FALSE, /* XXX: not implemented */
+  _add_children BOOL DEFAULT FALSE, /* XXX: not implemented */
+  _parent_task_id BIGINT DEFAULT NULL,
+  _force_priority INT DEFAULT NULL, /* run all nodes at this priority */
+  flow_id OUT BIGINT) RETURNS BIGINT AS
+$$
+BEGIN
+  IF (SELECT client_only FROM async.client_control)
+  THEN
+    PERFORM * FROM dblink(
+      async.server(), 
+      format(
+        'SELECT 0 FROM flow.create_flow(%s, %s, %s, %s, %s, %s, %s)', 
+        quote_literal($1), 
+        quote_literal($2), 
+        quote_nullable($3), 
+        quote_nullable($4), 
+        quote_nullable($5), 
+        quote_nullable($6), 
+        quote_nullable($7))) 
+        AS R(V INT);
+    RETURN;
+  END IF; 
 
+  INSERT INTO flow.flow(flow, 
+    arguments, parent_task_id, only_these_nodes, parent_flow_id, force_priority)
+  SELECT 
+    _flow,
+    _arguments,
+    _parent_task_id,
+    _only_these_nodes,
+    t.flow_id,
+    /* force priority can be directly specfified, or inherited from the 
+     * creating parent step if there is one.
+     */
+    COALESCE(_force_priority, t.priority)
+  FROM flow.flow_configuration
+  LEFT JOIN flow.v_flow_task t ON
+    t.task_id = _parent_task_id
+  WHERE flow = _flow
+  RETURNING flow.flow_id INTO create_flow.flow_id;
+
+  IF NOT FOUND THEN
+    /* not server logged intentionally since this is a end user invokable 
+     * routine.
+     */
+    RAISE EXCEPTION 'Missing flow configuration %', _flow;
+  END IF;
+
+  /* Copy the dependency configuration into the flow_id based instance, so that
+   * dependences 'as processed' are preserved. 
+   */
+  INSERT INTO flow.dependency SELECT 
+    create_flow.flow_id,
+    parent,
+    child,
+    continue_on_failure
+  FROM flow.dependency_configuration dc
+  WHERE dc.flow = _flow;
+
+  /* Push task from nodes that have no parent */
+  PERFORM flow.push_tasks(
+    create_flow.flow_id,
+    array_agg((node, '{}')::flow.task_wrapper_t),
+    CASE 
+      WHEN empty THEN 'EMPTY' 
+      WHEN _only_these_nodes IS NULL THEN 'EXECUTE'
+      WHEN node = ANY(_only_these_nodes) THEN 'EXECUTE'
+      ELSE 'EMPTY'
+    END::async.task_run_type_t,
+    'create flow')
+  FROM
+  (
+    SELECT 
+      fn.node,
+      n.empty
+    FROM flow.flow_node fn
+    JOIN flow.node n USING(node)
+    WHERE 
+      fn.flow = _flow
+      AND NOT EXISTS (
+        SELECT 1 FROM flow.dependency d2
+        WHERE 
+          d2.flow_id = create_flow.flow_id
+          AND d2.child = fn.node
+      )
+  ) q
+  GROUP BY CASE 
+      WHEN empty THEN 'EMPTY' 
+      WHEN _only_these_nodes IS NULL THEN 'EXECUTE'
+      WHEN node = ANY(_only_these_nodes) THEN 'EXECUTE'
+      ELSE 'EMPTY'
+    END::async.task_run_type_t;
+
+  /* do we actually have to do anything? */
+  IF NOT EXISTS (
+    SELECT 1 FROM flow.v_flow_task t
+    WHERE t.flow_id = create_flow.flow_id)
+  THEN
+    PERFORM async.log(
+      'WARNING', 
+      format(
+        'Auto finishing empty flow %s',
+        create_flow.flow_id));
+
+    UPDATE flow.flow f SET processed = clock_timestamp()
+    WHERE f.flow_id = create_flow.flow_id;
+  END IF;
+END;
+$$ LANGUAGE PLPGSQL;
 
 

@@ -99,6 +99,16 @@ BEGIN
    array_agg((_node, a)::flow.task_wrapper_t),
    _source := 'push steps')
   FROM unnest(_arguments) a;
+
+  UPDATE flow.v_flow_task SET yield_upon_finish = true
+  WHERE 
+    flow_id = _flow_id
+    AND node = _node 
+    AND is_node
+    AND processed IS NULL
+    AND yield_upon_finish IS NOT TRUE
+    AND array_upper(_arguments, 1) >= 1;
+
 END;    
 $$ LANGUAGE PLPGSQL;
 

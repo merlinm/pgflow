@@ -89,7 +89,7 @@ CREATE TABLE flow.node
 
 CREATE INDEX ON flow.node(target);
 
-/* ataches a node to a flow.  Mainly used to place nodes with no dependencies */
+/* ataches a node to a flow. */
 CREATE TABLE flow.flow_node
 (
   flow TEXT REFERENCES flow.flow_configuration 
@@ -154,7 +154,7 @@ CREATE TABLE flow.flow
   /* if created from a step, when the flow resolves, go back and mark that 
    * step complete as well.
    */
-  parent_task_id BIGINT REFERENCES async.task ON DELETE CASCADE,
+  parent_task_id BIGINT,
 
   /* if non-null, nodes not in this list will not be processed. */
   only_these_nodes TEXT[],
@@ -208,7 +208,7 @@ CREATE TYPE flow.task_wrapper_t AS
  * extend the task table so that the same exact step can not be implemented 
  * two or more times in the same flow.
  */
-CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
+CREATE UNIQUE INDEX IF NOT EXISTS task_running_flow_idx ON async.task_running
   ( 
     (((task_data)->>'flow_id')::BIGINT),
     ((task_data)->>'node'),
@@ -216,12 +216,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS task_flow_idx ON async.task
   )
 WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
 
-CREATE INDEX ON async.task(
+CREATE UNIQUE INDEX IF NOT EXISTS task_complete_flow_idx ON async.task_complete
+  ( 
+    (((task_data)->>'flow_id')::BIGINT),
+    ((task_data)->>'node'),
+    ((task_data)->'step_arguments')
+  )
+WHERE ((task_data)->>'flow_id')::BIGINT IS NOT NULL;  
+
+CREATE INDEX ON async.task_running(
   (((task_data)->>'flow_id')::BIGINT),
   ((task_data)->>'node')) 
 WHERE 
   processed IS NULL
   AND ((task_data)->>'flow_id')::BIGINT IS NOT NULL;
+
 
 END;
 $bootstrap$;
@@ -254,7 +263,7 @@ BEGIN
   FROM async.task t
   WHERE 
     task_id = new.parent_task_id
-    AND Processed IS NULL;
+    AND processed IS NULL;
 
   SELECT INTO s * FROM flow.v_flow_status_internal WHERE flow_id = new.flow_id;
 
@@ -389,7 +398,10 @@ CREATE OR REPLACE FUNCTION flow.push_tasks(
   _run_type async.task_run_type_t DEFAULT 'EXECUTE',
   _source TEXT DEFAULT NULL) RETURNS VOID AS 
 $$
-  SELECT
+DECLARE
+  r RECORD;
+BEGIN
+  PERFORM
     async.push_tasks(array_agg(
       (
         flow.task_data(
@@ -446,7 +458,23 @@ $$
         THEN 'EXECUTE_NOASYNC'
       ELSE _run_type
     END;
-$$ LANGUAGE SQL;
+
+  FOR r IN 
+    SELECT
+      node,
+      array_agg(arguments) args
+    FROM unnest(_tasks) t
+    JOIN flow.step USING(node)
+    WHERE flow.is_node(step_arguments)
+    GROUP BY 1
+  LOOP
+    CALL flow.push_steps(
+      _flow_id,  
+      r.node,
+      r.args);
+  END LOOP;
+END;
+$$ LANGUAGE PLPGSQL;
 
 
 
@@ -791,6 +819,7 @@ BEGIN
 END;
 $$ LANGUAGE PLPGSQL;
 
+/*
 
 CREATE OR REPLACE TRIGGER on_flow_check_node_steps
   BEFORE INSERT OR UPDATE ON async.task 
@@ -813,6 +842,8 @@ CREATE OR REPLACE TRIGGER on_flow_check_node_steps
     AND new.finish_status = 'FINISHED'
   )  
   EXECUTE PROCEDURE flow.check_node_steps();
+*/
+
 
 /* clean up processes when orchestator starts */
 CREATE OR REPLACE PROCEDURE flow.async_startup() AS

@@ -2,7 +2,6 @@
 /* Views and functions to support flow administration from UI */
 
 
-
 /* get flow data and status */
 CREATE OR REPLACE VIEW flow.v_flow_node_status AS
   SELECT 

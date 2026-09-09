@@ -729,120 +729,12 @@ CREATE OR REPLACE TRIGGER on_flow_task_complete
      * ...task is completing and...
      */
     new.processed IS NOT NULL
-
-    AND new.tracked IS DISTINCT FROM FALSE
     /* ...this is a task attached to flow  and ... */
     AND (new.task_data->>'flow_id') IS NOT NULL
     /* this is not a failure that itself is trigger fired */    
     AND new.finish_status IN ('FINISHED', 'FAILED', 'TIMED_OUT', 'DOA')
   )  
   EXECUTE PROCEDURE flow.task_complete();
-
-
-
-/* directly attaches to async table for dependency processing 
- * 
- * Trigger intercepts node completion, if (and only if) it has steps, so that 
- * the node is not considered complete, but is yielded, while the steps are 
- * processing.  The last step completing (or node timeout) will then force the
- * node to complete.
- * 
- * For asynchronous nodes that have actual work to do, this is a 'second yield',
- * where the first is for the asynchronous processing response, the second is 
- * for pending steps.  To demystify this, the 'source' column is adjusted to 
- * note that yield is pending step completion.  Since this adjusts data en route
- * to the table, it's a before trigger which will also suppress the regular 
- * dependence processing trigger.
- */
-CREATE OR REPLACE FUNCTION flow.check_node_steps() RETURNS TRIGGER AS
-$$
-DECLARE
-  _flow_id INT DEFAULT (new.task_data->>'flow_id')::BIGINT;
-  _node TEXT DEFAULT new.task_data->>'node';
-  f flow.flow;
-BEGIN
-  IF OLD.source = 'step processing'
-  THEN
-    /* bail if task has already been yielded for step processing */
-    RETURN new;
-  END IF;
-
-  /* if we are not running the complete flow, do not push anything if the node 
-   * is not in the list of nodes to run.
-   */
-  SELECT INTO f * from flow.flow WHERE flow_id = _flow_id;
-
-  IF f.only_these_nodes IS NOT NULL AND NOT _node = ANY(f.only_these_nodes)
-  THEN
-    RETURN new;
-  END IF;
-
-  /* to have gotten here, we know that the node is first completing via hacking, 
-   * er, adjusting the source column to track having done this.  Only need to 
-   * check node table to see if it has defined steps, or there are steps stashed
-   * in the task itself via runtime configuration.  If neither are the case,
-   * resolve without adjustment.
-   */
-  PERFORM flow.push_tasks(
-    _flow_id,
-    array_agg(t),
-    _source := 'trigger create steps')
-  FROM
-  (
-    SELECT 
-      (
-        _node,
-        arguments
-      )::flow.task_wrapper_t AS t
-    FROM flow.step s
-    WHERE s.node = _node
-  ) q
-  HAVING COUNT(*) > 0;
-
-  IF EXISTS (
-    SELECT 1 FROM flow.v_flow_task
-    WHERE 
-      flow_id = _flow_id
-      AND node = _node
-      AND NOT is_node)
-  THEN
-    /* yield the task for step processing */
-    new.processed := NULL;
-    new.yielded := clock_timestamp();
-    new.failed := NULL;
-    new.processing_error := NULL;
-    new.finish_status = 'YIELDED';
-    new.source := 'step processing';
-  END IF;
-
-  RETURN new;  
-END;
-$$ LANGUAGE PLPGSQL;
-
-/*
-
-CREATE OR REPLACE TRIGGER on_flow_check_node_steps
-  BEFORE INSERT OR UPDATE ON async.task 
-  FOR EACH ROW WHEN (
-    /* do not fire trigger unless... 
-     *
-     * ...task is completing and...
-     */
-    new.processed IS NOT NULL
-
-    AND new.tracked IS DISTINCT FROM FALSE
-
-    /* ...this is a task attached to flow  and ... */
-    AND (new.task_data->>'flow_id') IS NOT NULL
-
-    /* ...is a node ... */
-    AND flow.is_node(new.task_data->'step_arguments')
-
-    /* this is not a failure that itself is trigger fired */    
-    AND new.finish_status = 'FINISHED'
-  )  
-  EXECUTE PROCEDURE flow.check_node_steps();
-*/
 
 
 /* clean up processes when orchestator starts */
